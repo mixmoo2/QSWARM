@@ -1,7 +1,7 @@
 --this is a quarry program by mix.moo2
 --I have only tested this with up to 16 
 --turtles I will update this when I do more 
--tests.
+--tests.
 local STATE_FILE = "quarry_master_state.json"
 local LOG_FILE = "quarry_log.txt"
 
