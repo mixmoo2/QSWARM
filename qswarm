@@ -1,0 +1,910 @@
+--it almost works
+local STATE_FILE = "quarry_master_state.json"
+local LOG_FILE = "quarry_log.txt"
+
+local FUEL_MARGIN = 30          -- always keep (trip home + this) fuel in the tank
+local FUEL_RESUME_BASE = 300    -- after a low-fuel stop, refuel to this (+ trip length)
+local TRASH = { "cobblestone", "cobbled_deepslate", "netherrack", "blackstone" }
+
+local SIG_LOWFUEL = "SIGNAL_LOW_FUEL"
+local SIG_INVFULL = "SIGNAL_INVENTORY_FULL"
+
+-- World facing (what GPS sees): 0 = N (-Z), 1 = E (+X), 2 = S (+Z), 3 = W (-X). {dx, dz}
+local WORLD_DIRS = { [0] = { 0, -1 }, [1] = { 1, 0 }, [2] = { 0, 1 }, [3] = { -1, 0 } }
+-- Swarm frame (defined by the master): +Z = forward, +X = right.
+-- Local heading: 0 = forward (+Z), 1 = right (+X), 2 = back (-Z), 3 = left (-X). {dx, dz}
+local HEAD = { [0] = { 0, 1 }, [1] = { 1, 0 }, [2] = { 0, -1 }, [3] = { -1, 0 } }
+
+local function defaultState()
+    return {
+        phase = "idle",
+        width = 16, length = 16, targetDepth = -5, worldStartY = 64,
+        relX = 0, relZ = 0, y = 64, heading = 0,
+        startX = 0, startZ = 0, startY = 64,
+        x0 = 0,
+        g = 0,
+        turtleId = 0, totalTurtles = 1,
+        swarmPort = 12345,
+    }
+end
+
+local state = defaultState()
+local homing = false
+local aborting = false
+
+local fatal, goHome, navigateTo, clearFluid
+local function log(level, message)
+    local line = "[" .. os.date("%H:%M:%S") .. "] [" .. level .. "] " .. tostring(message)
+    print(line)
+    pcall(function()
+        local f = fs.open(LOG_FILE, "a")
+        if f then
+            f.writeLine(line)
+            f.close()
+        end
+    end)
+end
+
+local saveWarned = false
+local function saveState()
+    local ok, err = pcall(function()
+        local json = textutils.serializeJSON(state)
+        local f = fs.open(STATE_FILE, "w")
+        if not f then error("cannot open state file", 0) end
+        f.write(json)
+        f.close()
+    end)
+    if not ok and not saveWarned then
+        saveWarned = true
+        print("WARNING: could not save state: " .. tostring(err))
+    end
+end
+
+local function loadState()
+    local ok, data = pcall(function()
+        if not fs.exists(STATE_FILE) then return nil end
+        local f = fs.open(STATE_FILE, "r")
+        if not f then return nil end
+        local text = f.readAll()
+        f.close()
+        if not text or text == "" then return nil end
+        return textutils.unserializeJSON(text)
+    end)
+    if not ok or type(data) ~= "table" then return false end
+    for k, v in pairs(data) do state[k] = v end
+    return true
+end
+
+-- ----------------------------------------------------------------------------
+-- Turtle primitives
+-- ----------------------------------------------------------------------------
+local OPS = {
+    forward = { move = turtle.forward, dig = turtle.dig, attack = turtle.attack,
+                detect = turtle.detect, inspect = turtle.inspect },
+    up      = { move = turtle.up, dig = turtle.digUp, attack = turtle.attackUp,
+                detect = turtle.detectUp, inspect = turtle.inspectUp },
+    down    = { move = turtle.down, dig = turtle.digDown, attack = turtle.attackDown,
+                detect = turtle.detectDown, inspect = turtle.inspectDown },
+}
+
+local function updateCoordinates(action)
+    if action == "forward" then
+        local d = HEAD[state.heading]
+        state.relX = state.relX + d[1]
+        state.relZ = state.relZ + d[2]
+    elseif action == "up" then
+        state.y = state.y + 1
+    elseif action == "down" then
+        state.y = state.y - 1
+    end
+end
+
+local function turnLeft()
+    turtle.turnLeft()
+    state.heading = (state.heading - 1) % 4
+    saveState()
+end
+
+local function turnRight()
+    turtle.turnRight()
+    state.heading = (state.heading + 1) % 4
+    saveState()
+end
+
+local function faceHeading(target)
+    local turns = (target - state.heading) % 4
+    if turns == 1 then turnRight()
+    elseif turns == 2 then turnRight() turnRight()
+    elseif turns == 3 then turnLeft()
+    end
+end
+
+-- True if the block in that direction is a turtle / computer (never dig those).
+local function isTurtleBlock(dir)
+    local ok, data = OPS[dir].inspect()
+    if not ok or type(data) ~= "table" or type(data.name) ~= "string" then return false end
+    local name = string.lower(data.name)
+    return string.find(name, "turtle", 1, true) ~= nil
+        or string.find(name, "computer", 1, true) ~= nil
+end
+
+local PLACE = { forward = turtle.place, up = turtle.placeUp, down = turtle.placeDown }
+
+-- True if the block in that direction is water or lava (source or flowing).
+local function fluidAt(dir)
+    local ok, data = OPS[dir].inspect()
+    if not ok or type(data) ~= "table" or type(data.name) ~= "string" then return false end
+    local n = string.lower(data.name)
+    return string.find(n, "water", 1, true) ~= nil or string.find(n, "lava", 1, true) ~= nil
+end
+
+-- ----------------------------------------------------------------------------
+-- Fuel
+-- ----------------------------------------------------------------------------
+local function fuelLevel()
+    local l = turtle.getFuelLevel()
+    if l == "unlimited" then return math.huge end
+    return l
+end
+
+local function isFuelItem(name)
+    name = string.lower(name)
+    return string.find(name, "coal", 1, true) ~= nil
+        or string.find(name, "lava_bucket", 1, true) ~= nil
+end
+
+-- Burns fuel items from the inventory until the tank holds `target`.
+local function refuelFromInventory(target)
+    if fuelLevel() >= target then return true end
+    for slot = 1, 16 do
+        if fuelLevel() >= target then break end
+        if turtle.getItemCount(slot) > 0 then
+            turtle.select(slot)
+            if turtle.refuel(0) then   -- 0 = only test whether the item is fuel
+                while fuelLevel() < target and turtle.getItemCount(slot) > 0 do
+                    if not turtle.refuel(1) then break end
+                end
+            end
+        end
+    end
+    turtle.select(1)
+    return fuelLevel() >= target
+end
+
+local function homeCost()
+    return math.abs(state.relX - state.startX)
+        + math.abs(state.relZ - state.startZ)
+        + math.abs(state.y - state.startY)
+end
+
+local function checkFuel()
+    if homing or aborting then return end
+    local lvl = fuelLevel()
+    if lvl == math.huge then return end
+    local need = homeCost() + FUEL_MARGIN
+    if lvl >= need then return end
+    refuelFromInventory(need + 100)
+    if fuelLevel() < need then error(SIG_LOWFUEL, 0) end
+end
+
+-- ----------------------------------------------------------------------------
+-- Movement (never digs a turtle; waits for it to move away instead)
+-- ----------------------------------------------------------------------------
+local function tryMove(dir)
+    local op = OPS[dir]
+    local attempts, waited = 0, 0
+    clearFluid(dir)   -- once: a liquid SOURCE in the target cell is replaced by a block (dug next)
+    while true do
+        checkFuel()
+        if op.move() then break end
+        if fuelLevel() == 0 then fatal("Out of fuel") end
+        if isTurtleBlock(dir) then
+            waited = waited + 1
+            if waited > 300 then fatal("Blocked by a turtle/computer for too long (" .. dir .. ")") end
+            os.sleep(1)
+        else
+            attempts = attempts + 1
+            if attempts > 30 then fatal("Movement blocked repeatedly (" .. dir .. ")") end
+            op.dig()
+            op.attack()
+            os.sleep(0.5)
+        end
+    end
+    updateCoordinates(dir)
+    saveState()
+end
+
+-- Clears the block in `dir` (for the up/down mining). Returns true if it is clear.
+local function safeDig(dir)
+    local op = OPS[dir]
+    local tries, waits = 0, 0
+    while op.detect() do
+        if isTurtleBlock(dir) then
+            waits = waits + 1
+            if waits > 120 then return false end
+            os.sleep(1)
+        else
+            tries = tries + 1
+            if tries > 5 then return false end
+            op.dig()
+        end
+    end
+    return true
+end
+
+function navigateTo(tx, ty, tz, th, vertFirst)
+    if vertFirst == nil then vertFirst = true end
+
+    local function vertical()
+        while state.y < ty do tryMove("up") end
+        while state.y > ty do tryMove("down") end
+    end
+
+    local function horizontal()
+        if state.relX ~= tx then
+            faceHeading(state.relX < tx and 1 or 3)
+            while state.relX ~= tx do tryMove("forward") end
+        end
+        if state.relZ ~= tz then
+            faceHeading(state.relZ < tz and 0 or 2)
+            while state.relZ ~= tz do tryMove("forward") end
+        end
+    end
+
+    if vertFirst then vertical() horizontal() else horizontal() vertical() end
+    if th ~= nil then faceHeading(th) end
+end
+
+-- Up the (already mined) column first, then across to the start cell.
+function goHome()
+    navigateTo(state.startX, state.startY, state.startZ, 0, true)
+end
+
+-- Emergency stop: try to walk home, then stop the program with an error.
+function fatal(reason)
+    if aborting then error(reason, 0) end
+    aborting = true
+    log("CRITICAL", reason)
+    pcall(goHome)
+    error("ABORTED: " .. reason, 0)
+end
+
+-- ----------------------------------------------------------------------------
+-- Inventory
+-- ----------------------------------------------------------------------------
+local function emptySlots()
+    local n = 0
+    for slot = 1, 16 do
+        if turtle.getItemCount(slot) == 0 then n = n + 1 end
+    end
+    return n
+end
+
+local function isTrash(name)
+    for _, t in ipairs(TRASH) do
+        if string.find(name, t, 1, true) then return true end
+    end
+    return false
+end
+
+-- The biggest stack of trash blocks is kept as filler for sealing liquids / walls.
+local function biggestTrashSlot()
+    local best, bestCount = nil, 0
+    for slot = 1, 16 do
+        local c = turtle.getItemCount(slot)
+        if c > bestCount then
+            local d = turtle.getItemDetail(slot)
+            if d and isTrash(d.name) then best, bestCount = slot, c end
+        end
+    end
+    return best
+end
+
+local function dropTrash()
+    local keep = biggestTrashSlot()
+    for slot = 1, 16 do
+        if slot ~= keep and turtle.getItemCount(slot) > 0 then
+            local d = turtle.getItemDetail(slot)
+            if d and isTrash(d.name) then
+                turtle.select(slot)
+                turtle.dropDown()
+            end
+        end
+    end
+    turtle.select(1)
+end
+
+-- ----------------------------------------------------------------------------
+-- Liquids and walls
+-- ----------------------------------------------------------------------------
+local fillerSlot = nil
+local warnedNoFiller = false
+
+local function findFillerSlot()
+    if fillerSlot and turtle.getItemCount(fillerSlot) > 0 then
+        local d = turtle.getItemDetail(fillerSlot)
+        if d and isTrash(d.name) then return fillerSlot end
+    end
+    fillerSlot = nil
+    for slot = 1, 16 do
+        if turtle.getItemCount(slot) > 0 then
+            local d = turtle.getItemDetail(slot)
+            if d and isTrash(d.name) then
+                fillerSlot = slot
+                return slot
+            end
+        end
+    end
+    return nil
+end
+
+-- Places one filler block in `dir` (works on air and on liquid).
+local function placeFiller(dir)
+    local slot = findFillerSlot()
+    if not slot then
+        if not warnedNoFiller then
+            warnedNoFiller = true
+            log("WARN", "No filler blocks (cobblestone etc.) to seal liquids/walls. Put a stack into the turtle.")
+        end
+        return false
+    end
+    turtle.select(slot)
+    local ok = PLACE[dir]()
+    turtle.select(1)
+    return ok
+end
+
+-- Replaces liquid in `dir` by a solid block (a few tries, flowing water can re-fill).
+function clearFluid(dir)
+    for _ = 1, 3 do
+        if not fluidAt(dir) then return true end
+        if not placeFiller(dir) then return false end
+    end
+    return not fluidAt(dir)
+end
+
+-- Dig the cell above/below; liquids are plugged first, and if liquid flows back in
+-- afterwards it is sealed with a block and left there.
+local function digCell(dir)
+    clearFluid(dir)
+    safeDig(dir)
+    if fluidAt(dir) then clearFluid(dir) end
+end
+
+-- Plugs liquid in the cells to the left and right of the turtle (sources there would
+-- flood the tunnel). The cell in front / above / below is handled while digging/moving.
+local function scanSides()
+    local h0 = state.heading
+    faceHeading((h0 + 1) % 4)
+    clearFluid("forward")
+    faceHeading((h0 + 3) % 4)
+    clearFluid("forward")
+    faceHeading(h0)
+end
+
+-- The block in FRONT must be solid; fill it in if it is air or liquid.
+local function sealForward()
+    for _ = 1, 3 do
+        local ok = turtle.inspect()
+        if ok and not fluidAt("forward") then return end
+        if not placeFiller("forward") then return end
+    end
+end
+
+local function chestBehind()
+    local ok, data = turtle.inspect()
+    if not ok or type(data) ~= "table" or type(data.name) ~= "string" then return false end
+    local n = string.lower(data.name)
+    return string.find(n, "chest", 1, true) ~= nil
+        or string.find(n, "barrel", 1, true) ~= nil
+        or string.find(n, "shulker", 1, true) ~= nil
+end
+
+-- At home: face backwards, empty everything except fuel into a chest if there is one.
+local function unloadIntoChest()
+    faceHeading(2)
+    local has = chestBehind()
+    if has then
+        local keep = biggestTrashSlot()   -- keep one stack of filler
+        for slot = 1, 16 do
+            if turtle.getItemCount(slot) > 0 then
+                local d = turtle.getItemDetail(slot)
+                if d and not isFuelItem(d.name) and slot ~= keep then
+                    turtle.select(slot)
+                    turtle.drop()
+                end
+            end
+        end
+        turtle.select(1)
+    end
+    faceHeading(0)
+    return has
+end
+
+local function unloadAtHome()
+    local n = 0
+    while true do
+        local has = unloadIntoChest()
+        if emptySlots() >= 4 then return end
+        n = n + 1
+        if n % 12 == 1 then
+            if has then
+                log("WARN", "Chest behind the turtle is full. Empty it (waiting)...")
+            else
+                log("WARN", "Inventory full and no chest behind the turtle. Empty me by hand (waiting)...")
+            end
+        end
+        os.sleep(5)
+    end
+end
+
+-- Called after every mined column. Raises a signal when the turtle is too full.
+local function checkInventory()
+    if emptySlots() > 3 then return end
+    dropTrash()
+    if emptySlots() <= 2 then error(SIG_INVFULL, 0) end
+end
+
+-- ----------------------------------------------------------------------------
+-- Quarry geometry
+-- ----------------------------------------------------------------------------
+-- Columns (swarm-frame X) that this turtle is responsible for.
+local function stripBounds()
+    local total, w, id = state.totalTurtles, state.width, state.turtleId
+    local base = math.floor(w / total)
+    local rem = w % total
+    local cols, off
+    if id < rem then
+        cols = base + 1
+        off = id * (base + 1)
+    else
+        cols = base
+        off = rem * (base + 1) + (id - rem) * base
+    end
+    return state.x0 + off, state.x0 + off + cols - 1, cols
+end
+
+-- Layers are 3 blocks tall. The turtle flies along the centre row and digs up and down.
+local function layerCount()
+    local topY = state.worldStartY - 1
+    local height = topY - state.targetDepth + 1
+    if height <= 0 then return 0 end
+    return math.ceil(height / 3)
+end
+
+local function layerCenterY(k)
+    local topY = state.worldStartY - 1
+    local c = topY - 1 - 3 * k
+    local minC = state.targetDepth + 1
+    if c < minC then c = minC end
+    return c
+end
+
+local function inRegionY(y)
+    return y <= state.worldStartY - 1 and y >= state.targetDepth
+end
+
+-- The top row of the work area is open to whatever is above it. If a liquid sits
+-- directly above, plug it (standing in the top row so we can see it).
+local function capTop()
+    tryMove("up")
+    clearFluid("up")
+    tryMove("down")
+end
+
+local function mineColumn()
+    if inRegionY(state.y + 1) then
+        digCell("up")
+        if not inRegionY(state.y + 2) then capTop() end
+    end
+    if inRegionY(state.y - 1) then digCell("down") end
+end
+
+-- Fill the ring just outside the work area on the three levels of this layer.
+-- Only cells on the outer edge of the quarry have an outside neighbour.
+local function sealEdges(x, z)
+    local hs = {}
+    if x == state.x0 then table.insert(hs, 3) end
+    if x == state.x0 + state.width - 1 then table.insert(hs, 1) end
+    if z == 0 then table.insert(hs, 2) end
+    if z == state.length - 1 then table.insert(hs, 0) end
+
+    for _, h in ipairs(hs) do
+        faceHeading(h)
+        if inRegionY(state.y) then sealForward() end
+        if inRegionY(state.y + 1) then
+            tryMove("up")
+            sealForward()
+            tryMove("down")
+        end
+        if inRegionY(state.y - 1) then
+            tryMove("down")
+            sealForward()
+            tryMove("up")
+        end
+    end
+end
+
+-- Snake through the strip: rows alternate direction, layers alternate z direction,
+-- so the end of one row is always next to the start of the next.
+local function mineRows()
+    local xs0, xe0, cols = stripBounds()
+    if cols <= 0 then return end
+    local L = state.length
+    local totalRows = layerCount() * L
+
+    while state.g < totalRows do
+        local g = state.g
+        local k = math.floor(g / L)
+        local r = g % L
+        local z = (k % 2 == 0) and r or (L - 1 - r)
+        local cy = layerCenterY(k)
+        local xa, xb, step
+        if g % 2 == 0 then xa, xb, step = xs0, xe0, 1 else xa, xb, step = xe0, xs0, -1 end
+
+        for x = xa, xb, step do
+            navigateTo(x, cy, z, nil, false)
+            scanSides()
+            mineColumn()
+            sealEdges(x, z)
+            checkInventory()
+        end
+
+        state.g = g + 1
+        saveState()
+    end
+end
+
+-- ----------------------------------------------------------------------------
+-- Recovery handlers
+-- ----------------------------------------------------------------------------
+local function handleLowFuel()
+    log("WARN", "Low fuel (" .. tostring(fuelLevel()) .. "). Returning home.")
+    homing = true
+    goHome()
+    local trip = state.width + state.length + math.max(0, state.startY - state.targetDepth) + 10
+    local target = FUEL_RESUME_BASE + trip
+    local n = 0
+    while not refuelFromInventory(target) do
+        n = n + 1
+        if n % 6 == 1 then
+            log("WARN", "Waiting for fuel. Put fuel (e.g. coal) into this turtle's inventory.")
+        end
+        os.sleep(5)
+    end
+    homing = false
+    log("INFO", "Refuelled to " .. tostring(fuelLevel()) .. ". Continuing.")
+end
+
+local function handleInventoryFull()
+    log("INFO", "Inventory full. Returning home to unload.")
+    homing = true
+    goHome()
+    unloadAtHome()
+    homing = false
+end
+
+local function runJob()
+    state.phase = "mining"
+    saveState()
+    if not findFillerSlot() then
+        log("WARN", "No filler blocks in the inventory. Put a stack of cobblestone into this turtle, "
+            .. "otherwise liquids/walls can only be sealed once it has mined some.")
+    end
+    local xs, xe = stripBounds()
+    log("INFO", "Mining: turtle " .. (state.turtleId + 1) .. " of " .. state.totalTurtles
+        .. ", columns " .. xs .. ".." .. xe .. ", " .. state.length .. " rows.")
+
+    while true do
+        local ok, err = pcall(function()
+            mineRows()
+            goHome()
+        end)
+        if ok then break end
+        if err == SIG_LOWFUEL then
+            handleLowFuel()
+        elseif err == SIG_INVFULL then
+            handleInventoryFull()
+        else
+            if not aborting then
+                aborting = true
+                log("CRITICAL", "Unexpected error: " .. tostring(err))
+                pcall(goHome)
+            end
+            error(err, 0)
+        end
+    end
+
+    unloadIntoChest()
+    state.phase = "done"
+    saveState()
+    log("INFO", "Quarry job complete.")
+end
+
+-- ----------------------------------------------------------------------------
+-- Swarm setup (GPS layout + rednet handshake)
+-- ----------------------------------------------------------------------------
+local function askNumber(prompt, default)
+    while true do
+        write(prompt .. " (default " .. tostring(default) .. "): ")
+        local s = read()
+        if s == nil or s == "" then return default end
+        local n = tonumber(s)
+        if n then return math.floor(n) end
+        print("Please enter a number.")
+    end
+end
+
+local function initSwarmNetwork()
+    for _, side in ipairs({ "left", "right" }) do
+        if peripheral.getType(side) == "modem" then
+            rednet.open(side)
+            log("SWARM", "Modem opened on the " .. side .. " side.")
+            return
+        end
+    end
+    error("No modem equipped on the turtle (left/right slot).", 0)
+end
+
+local function locate()
+    local x, y, z = gps.locate(3)
+    if not x then return nil end
+    return math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
+end
+
+-- Works out the world direction the turtle faces by stepping one block and asking GPS.
+-- It never digs anything: if front and back are both blocked it turns 90 degrees and
+-- tries again (and gives up, so the user is asked, if that is blocked as well).
+local function detectFacing(x1, z1)
+    for quarterTurns = 0, 1 do
+        local moved = nil
+        if turtle.forward() then
+            moved = "f"
+        elseif turtle.back() then
+            moved = "b"
+        end
+
+        if moved then
+            local x2, _, z2 = locate()
+            for _ = 1, 20 do   -- step back to where we started
+                local ok
+                if moved == "f" then ok = turtle.back() else ok = turtle.forward() end
+                if ok then break end
+                os.sleep(0.5)
+            end
+            if quarterTurns == 1 then turtle.turnLeft() end   -- restore the original facing
+            if not x2 then return nil end
+
+            local dx, dz = x2 - x1, z2 - z1
+            if moved == "b" then dx, dz = -dx, -dz end
+            local face = nil
+            if dx == 0 and dz == -1 then face = 0
+            elseif dx == 1 and dz == 0 then face = 1
+            elseif dx == 0 and dz == 1 then face = 2
+            elseif dx == -1 and dz == 0 then face = 3
+            end
+            if face == nil then return nil end
+            return (face - quarterTurns) % 4
+        end
+
+        if quarterTurns == 0 then turtle.turnRight() end
+    end
+    turtle.turnLeft()   -- undo the first quarter turn
+    return nil
+end
+
+local function askFacing()
+    while true do
+        write("Could not auto-detect the facing. Which way does this turtle face (n/e/s/w, see F3)? ")
+        local s = string.lower(read() or "")
+        if s == "n" then return 0
+        elseif s == "e" then return 1
+        elseif s == "s" then return 2
+        elseif s == "w" then return 3 end
+    end
+end
+
+-- Returns world x, y, z (GPS) and the world facing (0..3) of this turtle.
+local function measureSelf()
+    refuelFromInventory(50)
+    local x, _, z = locate()
+    if not x then
+        error("GPS not available: every turtle needs a GPS constellation in range.", 0)
+    end
+    local face = detectFacing(x, z)
+    if not face then face = askFacing() end
+    local x2, y2, z2 = locate()   -- detectFacing may not have returned to exactly the same block
+    if not x2 then error("GPS not available after facing detection.", 0) end
+    return x2, y2, z2, face
+end
+
+local function applyConfig(c)
+    state.turtleId = c.turtleId
+    state.totalTurtles = c.totalTurtles
+    state.relX = c.relX
+    state.relZ = c.relZ
+    state.y = c.y
+    state.heading = c.heading
+    state.startX = c.relX
+    state.startZ = c.relZ
+    state.startY = c.y
+    state.x0 = c.x0
+    state.width = c.width
+    state.length = c.length
+    state.targetDepth = c.targetDepth
+    state.worldStartY = c.worldStartY
+    state.g = 0
+end
+
+local function workerSetup(protocol, wx, wy, wz, wf)
+    log("SWARM", "Worker ready at " .. wx .. "," .. wy .. "," .. wz .. ". Waiting for the master...")
+    local cfg = nil
+    local nextHello = 0
+    while not cfg do
+        if os.clock() >= nextHello then
+            rednet.broadcast({ type = "HELLO", wx = wx, wy = wy, wz = wz, face = wf }, protocol)
+            nextHello = os.clock() + 2
+        end
+        local sender, msg = rednet.receive(protocol, 0.5)
+        if sender and type(msg) == "table" and msg.type == "JOB_CONFIG" then
+            cfg = msg
+            rednet.send(sender, { type = "ACK" }, protocol)
+        end
+    end
+    applyConfig(cfg)
+    log("SWARM", "Config received: turtle " .. (cfg.turtleId + 1) .. " of " .. cfg.totalTurtles .. ". Waiting for START...")
+
+    local deadline = os.clock() + 120
+    while true do
+        local sender, msg = rednet.receive(protocol, 1)
+        if sender and type(msg) == "table" then
+            if msg.type == "START" then return end
+            if msg.type == "JOB_CONFIG" then rednet.send(sender, { type = "ACK" }, protocol) end
+        end
+        if os.clock() > deadline then error("The master never sent START.", 0) end
+    end
+end
+
+local function masterSetup(protocol, mx, my, mz, mf)
+    local workers = {}
+    local width, length, depth
+
+    print("MASTER ready. Start the worker turtles now; they are discovered automatically.")
+    parallel.waitForAny(
+        function()
+            while true do
+                local sender, msg = rednet.receive(protocol)
+                if type(msg) == "table" and msg.type == "HELLO"
+                    and type(msg.wx) == "number" and type(msg.wy) == "number"
+                    and type(msg.wz) == "number" and WORLD_DIRS[msg.face] ~= nil then
+                    workers[sender] = { wx = msg.wx, wy = msg.wy, wz = msg.wz, face = msg.face }
+                end
+            end
+        end,
+        function()
+            width = math.max(1, askNumber("Quarry width (to the right)", 16))
+            length = math.max(1, askNumber("Quarry length (forward)", 16))
+            depth = askNumber("Target depth (world Y)", -5)
+            while true do
+                local count = 0
+                for _ in pairs(workers) do count = count + 1 end
+                write("Workers found: " .. count .. ". Type 'go' to dispatch (Enter to refresh): ")
+                if string.lower(read() or "") == "go" then break end
+            end
+        end
+    )
+
+    -- Everyone (master included), measured in the master's frame.
+    local participants = {
+        { cid = os.getComputerID(), wx = mx, wy = my, wz = mz, face = mf, master = true },
+    }
+    for cid, w in pairs(workers) do
+        table.insert(participants, { cid = cid, wx = w.wx, wy = w.wy, wz = w.wz, face = w.face })
+    end
+
+    local f = WORLD_DIRS[mf]
+    local r = WORLD_DIRS[(mf + 1) % 4]
+    for _, p in ipairs(participants) do
+        local dx, dz = p.wx - mx, p.wz - mz
+        p.relX = dx * r[1] + dz * r[2]
+        p.relZ = dx * f[1] + dz * f[2]
+        p.heading = (p.face - mf) % 4
+    end
+    table.sort(participants, function(a, b)
+        if a.relX ~= b.relX then return a.relX < b.relX end
+        if a.relZ ~= b.relZ then return a.relZ < b.relZ end
+        return a.cid < b.cid
+    end)
+
+    local total = #participants
+    local x0 = participants[1].relX
+    local configs = {}
+    for i, p in ipairs(participants) do
+        configs[i] = {
+            type = "JOB_CONFIG",
+            turtleId = i - 1, totalTurtles = total,
+            relX = p.relX, relZ = p.relZ, y = p.wy, heading = p.heading,
+            x0 = x0, width = width, length = length,
+            targetDepth = depth, worldStartY = my,
+        }
+    end
+
+    print("")
+    print("--- DISPATCH PLAN (" .. total .. " turtles) ---")
+    print("Quarry: " .. width .. " wide (right) x " .. length .. " long (forward), from Y=" .. (my - 1) .. " down to Y=" .. depth)
+    for i, p in ipairs(participants) do
+        print(string.format("  #%d computer %d%s at X=%d Z=%d", i, p.cid, p.master and " (master)" or "", p.relX, p.relZ))
+    end
+
+    -- Send each worker its config until it ACKs.
+    local pending = {}
+    for i, p in ipairs(participants) do
+        if not p.master then pending[p.cid] = configs[i] end
+    end
+    local deadline = os.clock() + 30
+    while next(pending) ~= nil and os.clock() < deadline do
+        for cid, msg in pairs(pending) do rednet.send(cid, msg, protocol) end
+        local timer = os.startTimer(1)
+        while true do
+            local ev, a, b, c = os.pullEvent()
+            if ev == "rednet_message" and c == protocol and type(b) == "table" and b.type == "ACK" then
+                pending[a] = nil
+            elseif ev == "timer" and a == timer then
+                break
+            end
+        end
+    end
+    if next(pending) ~= nil then
+        local ids = {}
+        for cid in pairs(pending) do table.insert(ids, tostring(cid)) end
+        error("No ACK from worker computer(s): " .. table.concat(ids, ", ") .. ". Nothing was started.", 0)
+    end
+
+    for i, p in ipairs(participants) do
+        if p.master then applyConfig(configs[i]) end
+    end
+
+    for _ = 1, 3 do
+        rednet.broadcast({ type = "START" }, protocol)
+        os.sleep(0.4)
+    end
+    log("SWARM", "All workers acknowledged. Swarm dispatched.")
+end
+
+local function setupSwarm()
+    state = defaultState()
+    pcall(fs.delete, STATE_FILE)
+
+    state.swarmPort = askNumber("Swarm port", 12345)
+    initSwarmNetwork()
+    local protocol = tostring(state.swarmPort)
+
+    local role = nil
+    while role ~= "m" and role ~= "w" do
+        write("Role - [m]aster or [w]orker: ")
+        role = string.sub(string.lower(read() or ""), 1, 1)
+    end
+
+    local wx, wy, wz, wf = measureSelf()
+    if role == "w" then
+        workerSetup(protocol, wx, wy, wz, wf)
+    else
+        masterSetup(protocol, wx, wy, wz, wf)
+    end
+end
+
+local function init()
+    if loadState() and state.phase == "mining" then
+        write("A previous job was found. Resume it? (y/n): ")
+        if string.lower(read() or "") == "n" then
+            setupSwarm()
+        else
+            log("INFO", "Resuming the previous job.")
+        end
+    else
+        setupSwarm()
+    end
+    runJob()
+end
+
+init()
